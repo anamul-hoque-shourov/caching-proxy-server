@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"caching-proxy-server/cache"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -21,21 +23,36 @@ func NewProxy(upstreamURL string, cacheDuration time.Duration) *Proxy {
 	}
 }
 
-func (p *Proxy) fetchFromUpstream(r *http.Request) ([]byte, int, error) {
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+func (p *Proxy) fetchFromUpstream(r *http.Request) ([]byte, int, http.Header, error) {
+	log.Printf("UPSTREAM   - GET %s", r.URL.RequestURI())
+
 	fullURL := p.UpstreamURL + r.URL.RequestURI()
 
-	resp, err := http.Get(fullURL)
+	req, err := http.NewRequest(r.Method, fullURL, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, resp.StatusCode, resp.Header, err
 	}
 
-	return body, resp.StatusCode, nil
+	if resp.StatusCode >= 400 {
+		return body, resp.StatusCode, resp.Header, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+
+	return body, resp.StatusCode, resp.Header, nil
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -47,15 +64,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.String()
 
 	if data, found := p.Cache.Get(cacheKey); found {
+		log.Printf("CACHE HIT  - %s %s", r.Method, r.URL.String())
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
 		return
 	}
+	log.Printf("CACHE MISS - %s %s", r.Method, r.URL.String())
 
-	body, status, err := p.fetchFromUpstream(r)
+	body, status, headers, err := p.fetchFromUpstream(r)
 	if err != nil {
-		http.Error(w, "Upstream error: "+err.Error(), http.StatusBadGateway)
+		w.WriteHeader(status)
+		w.Write(body)
 		return
+	}
+
+	for key, values := range headers {
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
 	}
 
 	p.Cache.Set(cacheKey, body, p.CacheDuration)
